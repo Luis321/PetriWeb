@@ -76,8 +76,16 @@ export default function App() {
   const [tab,         setTab]         = useState('props');
   const [toast,       setToast]       = useState('');
   const [showHelp,    setShowHelp]    = useState(false);
-  const svgRef   = useRef(null);
-  const fileRef  = useRef(null);
+  // ── Image import state ──
+  const [showImgModal, setShowImgModal] = useState(false);
+  const [imgApiKey,    setImgApiKey]    = useState(() => localStorage.getItem('petri_api_key') || '');
+  const [imgFile,      setImgFile]      = useState(null);
+  const [imgPreview,   setImgPreview]   = useState(null);
+  const [imgLoading,   setImgLoading]   = useState(false);
+  const [imgError,     setImgError]     = useState('');
+  const svgRef    = useRef(null);
+  const fileRef   = useRef(null);
+  const imgFileRef = useRef(null);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
@@ -287,6 +295,89 @@ export default function App() {
     }, 20);
   };
 
+  // ── Image import helpers ──
+  const handleImgFile = (file) => {
+    if (!file || !file.type.startsWith('image/')) {
+      setImgError('El archivo debe ser una imagen (PNG, JPG, WEBP, etc.).');
+      return;
+    }
+    setImgFile(file);
+    setImgError('');
+    const reader = new FileReader();
+    reader.onload = (e) => setImgPreview(e.target.result);
+    reader.readAsDataURL(file);
+  };
+
+  const importFromImage = async () => {
+    if (!imgFile) { setImgError('Selecciona una imagen primero.'); return; }
+    if (!imgApiKey.trim()) { setImgError('Introduce tu API key de Anthropic.'); return; }
+    setImgLoading(true);
+    setImgError('');
+    try {
+      const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload  = (e) => resolve(e.target.result.split(',')[1]);
+        reader.onerror = reject;
+        reader.readAsDataURL(imgFile);
+      });
+      const mediaType = imgFile.type || 'image/jpeg';
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': imgApiKey.trim(),
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        body: JSON.stringify({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 4096,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+              { type: 'text', text: `Analiza este diagrama de red de Petri y extrae todos sus elementos. Devuelve ÚNICAMENTE un objeto JSON válido con esta estructura exacta (sin texto adicional, sin markdown):
+
+{"places":[{"id":"p1","x":150,"y":150,"name":"P1","tokens":0}],"transitions":[{"id":"t1","x":350,"y":150,"name":"T1","type":"timed","dist":{"type":"exp","lambda":1},"weight":1,"priority":0}],"arcs":[{"id":"a1","from":"p1","fromType":"place","to":"t1","toType":"transition","weight":1}]}
+
+Reglas importantes:
+- Los lugares son CÍRCULOS. IDs: p1, p2, p3...
+- Las transiciones son RECTÁNGULOS o BARRAS. IDs: t1, t2, t3...
+- Los arcos conectan lugares↔transiciones alternadamente. IDs: a1, a2, a3...
+- Si una transición está rellena de negro/sólida (inmediata): type:"immediate", dist:null, weight:1.
+- Posiciona los elementos con al menos 160px de separación. Primer elemento cerca de x:150, y:150.
+- Si un lugar tiene tokens visibles (puntos o número dentro del círculo), pon ese valor en "tokens".
+- Si un arco tiene un número escrito, úsalo como "weight" (por defecto 1).
+- Respeta la topología real: solo arcos donde realmente existen en el diagrama.
+- Devuelve SOLO el JSON, sin explicaciones.` }
+            ]
+          }]
+        })
+      });
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.error?.message || `HTTP ${response.status}`);
+      }
+      const data = await response.json();
+      const text = data.content?.[0]?.text || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error('La IA no devolvió un JSON válido. Inténtalo de nuevo.');
+      const net = JSON.parse(jsonMatch[0]);
+      if (!Array.isArray(net.places) || !Array.isArray(net.transitions) || !Array.isArray(net.arcs))
+        throw new Error('JSON incompleto: faltan places, transitions o arcs.');
+      localStorage.setItem('petri_api_key', imgApiKey.trim());
+      loadNet(net);
+      setTimeout(fitView, 60);
+      setShowImgModal(false);
+      setImgFile(null); setImgPreview(null);
+      showToast(`✨ Red generada: ${net.places.length} lugares, ${net.transitions.length} trans., ${net.arcs.length} arcos`);
+    } catch (err) {
+      setImgError('Error: ' + err.message);
+    } finally {
+      setImgLoading(false);
+    }
+  };
+
   // ── Export / Import ──
   const exportJSON = () => {
     const data = JSON.stringify({ places, transitions, arcs }, null, 2);
@@ -353,6 +444,7 @@ export default function App() {
           <button className="action-btn" onClick={() => fileRef.current?.click()} title="Importar JSON">↑ JSON</button>
           <input ref={fileRef} type="file" accept=".json" style={{ display: 'none' }}
             onChange={e => e.target.files[0] && importJSON(e.target.files[0])} />
+          <button className="action-btn img-btn" onClick={() => setShowImgModal(true)} title="Generar red desde imagen (Claude IA)">🖼 Imagen</button>
           <button className="action-btn danger" onClick={clearAll} title="Limpiar todo">✕ Limpiar</button>
           <button className="action-btn info" onClick={() => setShowHelp(v => !v)} title="Ayuda">?</button>
         </div>
@@ -674,6 +766,64 @@ export default function App() {
 
       {/* ── TOAST ── */}
       {toast && <div className="toast">{toast}</div>}
+
+      {/* ── IMAGE IMPORT MODAL ── */}
+      {showImgModal && (
+        <div className="modal-overlay" onClick={() => { if (!imgLoading) { setShowImgModal(false); setImgError(''); } }}>
+          <div className="modal modal-img" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>🖼 Generar Red desde Imagen</h2>
+              <button className="modal-close" onClick={() => { if (!imgLoading) { setShowImgModal(false); setImgError(''); } }}>✕</button>
+            </div>
+            <div className="modal-body">
+              <p className="hint" style={{ marginBottom: 12 }}>
+                Sube una foto o captura de pantalla de una red de Petri y Claude la analizará para generar los elementos editables automáticamente.
+              </p>
+
+              {/* Drop zone */}
+              <div className="img-drop-zone"
+                onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add('drag-over'); }}
+                onDragLeave={e => e.currentTarget.classList.remove('drag-over')}
+                onDrop={e => { e.preventDefault(); e.currentTarget.classList.remove('drag-over'); handleImgFile(e.dataTransfer.files[0]); }}
+                onClick={() => imgFileRef.current?.click()}>
+                {imgPreview
+                  ? <img src={imgPreview} alt="Vista previa" className="img-preview" />
+                  : (
+                    <div className="img-drop-placeholder">
+                      <span>📁</span>
+                      <span>Arrastra una imagen aquí o haz clic para seleccionar</span>
+                      <span style={{ fontSize: 11 }}>PNG · JPG · WEBP · GIF</span>
+                    </div>
+                  )
+                }
+              </div>
+              <input ref={imgFileRef} type="file" accept="image/*" style={{ display: 'none' }}
+                onChange={e => e.target.files[0] && handleImgFile(e.target.files[0])} />
+              {imgPreview && (
+                <button className="img-change-btn" onClick={() => imgFileRef.current?.click()}>↺ Cambiar imagen</button>
+              )}
+
+              {/* API Key */}
+              <label className="field" style={{ marginTop: 10 }}>
+                <span className="field-label">API Key de Anthropic (guardada en tu navegador)</span>
+                <input type="password" className="inp" placeholder="sk-ant-api03-…"
+                  value={imgApiKey} onChange={e => setImgApiKey(e.target.value)} />
+              </label>
+              <p className="hint" style={{ fontSize: 11, marginTop: 4 }}>
+                Obtén tu clave en <strong>console.anthropic.com</strong>. Solo se usa para llamar a la API de Anthropic; no se envía a ningún otro servidor.
+              </p>
+
+              {imgError && <div className="img-error">{imgError}</div>}
+
+              <button className="run-btn" style={{ marginTop: 14 }}
+                onClick={importFromImage}
+                disabled={imgLoading || !imgFile || !imgApiKey.trim()}>
+                {imgLoading ? '⏳ Analizando imagen con IA…' : '✨ Generar Red de Petri'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── HELP MODAL ── */}
       {showHelp && (
